@@ -1,0 +1,1517 @@
+import {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+  memo,
+} from "react";
+import { getClient } from "@/api/AxiosClient";
+import { useCredentialGetter } from "@/hooks/useCredentialGetter";
+import { useParams } from "react-router-dom";
+import { ReloadIcon, Cross2Icon } from "@radix-ui/react-icons";
+import { stringify as convertToYAML } from "yaml";
+import { useWorkflowHasChangesStore } from "@/store/WorkflowHasChangesStore";
+import { WorkflowCreateYAMLRequest } from "@/routes/workflows/types/workflowYamlTypes";
+import { WorkflowApiResponse } from "@/routes/workflows/types/workflowTypes";
+import { toast } from "@/components/ui/use-toast";
+import { getSseClient } from "@/api/sse";
+import {
+  WorkflowCopilotCancelRequest,
+  WorkflowCopilotChatHistoryResponse,
+  WorkflowCopilotProcessingUpdate,
+  WorkflowCopilotStreamErrorUpdate,
+  WorkflowCopilotStreamResponseUpdate,
+  WorkflowCopilotToolCallUpdate,
+  WorkflowCopilotToolResultUpdate,
+  WorkflowCopilotCondensingUpdate,
+  WorkflowCopilotNarrationUpdate,
+  WorkflowCopilotBlockProgressUpdate,
+  WorkflowCopilotChatSender,
+  WorkflowCopilotChatRequest,
+  WorkflowCopilotClearProposedWorkflowRequest,
+  WorkflowCopilotApplyProposedWorkflowRequest,
+} from "./workflowCopilotTypes";
+import {
+  ToolActivity,
+  applyBlockProgress,
+  applyToolCall,
+  applyToolResult,
+  getActivityDotClass,
+} from "./toolActivity";
+import {
+  shouldQueuePromptForLiveBrowser,
+  shouldWaitForLiveBrowser,
+} from "./browserReadiness";
+
+interface ChatMessage {
+  id: string;
+  sender: WorkflowCopilotChatSender;
+  content: string;
+  timestamp?: string;
+}
+
+type QueuedPrompt = {
+  id: string;
+  content: string;
+};
+
+type SendOptions = {
+  queuedMessageId?: string;
+  skipQueue?: boolean;
+};
+
+type WorkflowCopilotSsePayload =
+  | WorkflowCopilotProcessingUpdate
+  | WorkflowCopilotStreamResponseUpdate
+  | WorkflowCopilotStreamErrorUpdate
+  | WorkflowCopilotToolCallUpdate
+  | WorkflowCopilotToolResultUpdate
+  | WorkflowCopilotCondensingUpdate
+  | WorkflowCopilotNarrationUpdate
+  | WorkflowCopilotBlockProgressUpdate;
+
+const TOOL_DISPLAY_NAMES: Record<string, string> = {
+  update_workflow: "Updating workflow",
+  update_and_run_blocks: "Updating & running blocks",
+  list_credentials: "Listing credentials",
+  get_block_schema: "Looking up block schema",
+  validate_block: "Validating block",
+  run_blocks_and_collect_debug: "Running blocks",
+  get_run_results: "Getting run results",
+  get_browser_screenshot: "Taking screenshot",
+  navigate_browser: "Navigating browser",
+  evaluate: "Inspecting the page",
+  click: "Clicking on the page",
+  type_text: "Filling a field",
+  scroll: "Scrolling",
+  console_messages: "Reading console",
+  select_option: "Selecting option",
+  press_key: "Pressing key",
+};
+
+const formatChatTimestamp = (value: string) => {
+  let normalizedValue = value.replace(/\.(\d{3})\d*/, ".$1");
+  if (!normalizedValue.endsWith("Z")) {
+    normalizedValue += "Z";
+  }
+  return new Date(normalizedValue).toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  });
+};
+
+interface MessageItemProps {
+  message: ChatMessage;
+  footer?: React.ReactNode;
+}
+
+const MessageItem = memo(({ message, footer }: MessageItemProps) => {
+  return (
+    <div className="flex items-start gap-3">
+      <div
+        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold text-white ${
+          message.sender === "ai" ? "bg-blue-600" : "bg-purple-600"
+        }`}
+      >
+        {message.sender === "ai" ? "AI" : "U"}
+      </div>
+      <div className="relative flex-1 rounded-lg bg-slate-800 p-3 pr-12">
+        <p className="whitespace-pre-wrap pr-3 text-sm text-slate-200">
+          {message.content}
+        </p>
+        {footer ? <div className="mt-3 flex gap-2">{footer}</div> : null}
+        {message.timestamp ? (
+          <span className="pointer-events-none absolute bottom-2 right-2 rounded bg-slate-900/70 px-1.5 py-0.5 text-[10px] text-slate-400">
+            {formatChatTimestamp(message.timestamp)}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+});
+
+interface WorkflowCopilotChatProps {
+  // `options.persisted` true = atomic accept (server already wrote new version); false/undefined = local edit.
+  onWorkflowUpdate?: (
+    workflow: WorkflowApiResponse,
+    options?: { persisted?: boolean },
+  ) => void;
+  onReviewWorkflow?: (
+    workflow: WorkflowApiResponse,
+    clearPending: () => void,
+  ) => void;
+  isOpen?: boolean;
+  onClose?: () => void;
+  onMessageCountChange?: (count: number) => void;
+  buttonRef?: React.RefObject<HTMLButtonElement>;
+  liveBrowserSessionId?: string | null;
+  requiresLiveBrowser?: boolean;
+  isLiveBrowserReady?: boolean;
+  initialMessage?: string;
+  onInitialMessageConsumed?: () => void;
+}
+
+const AUTO_SEND_TIMEOUT_MS = 5000;
+
+const DEFAULT_WINDOW_WIDTH = 600;
+const DEFAULT_WINDOW_HEIGHT = 400;
+const MIN_WINDOW_WIDTH = 300;
+const MIN_WINDOW_HEIGHT = 300;
+const OFFSET = 24;
+
+const calculateDefaultPosition = (
+  width: number,
+  height: number,
+  buttonRef?: React.RefObject<HTMLButtonElement>,
+) => {
+  // If button ref is available, align left edge of window with left edge of button
+  if (buttonRef?.current) {
+    const buttonRect = buttonRef.current.getBoundingClientRect();
+    return {
+      x: buttonRect.left - OFFSET,
+      y: window.innerHeight - height - 2 * OFFSET,
+    };
+  }
+
+  // Fallback to centered position
+  return {
+    x: window.innerWidth / 2 - width / 2,
+    y: window.innerHeight - height - 2 * OFFSET,
+  };
+};
+
+const constrainPosition = (
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+) => {
+  const maxX = window.innerWidth - width - OFFSET;
+  const maxY = window.innerHeight - height - OFFSET;
+
+  return {
+    x: Math.min(Math.max(0, x), maxX),
+    y: Math.min(Math.max(0, y), maxY),
+  };
+};
+
+export function WorkflowCopilotChat({
+  onWorkflowUpdate,
+  onReviewWorkflow,
+  isOpen = true,
+  onClose,
+  onMessageCountChange,
+  buttonRef,
+  liveBrowserSessionId,
+  requiresLiveBrowser = false,
+  isLiveBrowserReady = false,
+  initialMessage,
+  onInitialMessageConsumed,
+}: WorkflowCopilotChatProps = {}) {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [proposedWorkflow, setProposedWorkflow] =
+    useState<WorkflowApiResponse | null>(null);
+  const [autoAccept, setAutoAccept] = useState<boolean>(false);
+  const [inputValue, setInputValue] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [queuedPrompt, setQueuedPrompt] = useState<QueuedPrompt | null>(null);
+  const [processingStatus, setProcessingStatus] = useState<string>("");
+  const [latestNarration, setLatestNarration] = useState<string>("");
+  const [toolActivity, setToolActivity] = useState<ToolActivity[]>([]);
+  const [isLoadingHistory, setIsLoadingHistory] = useState(false);
+  const streamingAbortController = useRef<AbortController | null>(null);
+  const pendingMessageId = useRef<string | null>(null);
+  const pendingCancelToken = useRef<string | null>(null);
+  const cancelSafetyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Backend cancel watcher polls Redis: a turn can complete normally between
+  // the cancel POST and the watcher firing, so the frontend must remember it.
+  const cancelInFlightController = useRef<AbortController | null>(null);
+  const [workflowCopilotChatId, setWorkflowCopilotChatId] = useState<
+    string | null
+  >(null);
+  // Mirrors workflowCopilotChatId for async handlers that would otherwise
+  // close over a stale value across renders (e.g. clearProposedWorkflow).
+  const workflowCopilotChatIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    workflowCopilotChatIdRef.current = workflowCopilotChatId;
+  }, [workflowCopilotChatId]);
+  useEffect(() => {
+    return () => {
+      streamingAbortController.current?.abort();
+      if (cancelSafetyTimer.current !== null) {
+        clearTimeout(cancelSafetyTimer.current);
+        cancelSafetyTimer.current = null;
+      }
+    };
+  }, []);
+  const [size, setSize] = useState({
+    width: DEFAULT_WINDOW_WIDTH,
+    height: DEFAULT_WINDOW_HEIGHT,
+  });
+  const [position, setPosition] = useState(
+    calculateDefaultPosition(
+      DEFAULT_WINDOW_WIDTH,
+      DEFAULT_WINDOW_HEIGHT,
+      buttonRef,
+    ),
+  );
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [isResizing, setIsResizing] = useState(false);
+  const [resizeDirection, setResizeDirection] = useState<
+    "n" | "s" | "e" | "w" | "se" | "sw" | "ne" | "nw"
+  >("se");
+  const [resizeStart, setResizeStart] = useState({
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+    posX: 0,
+    posY: 0,
+  });
+  const credentialGetter = useCredentialGetter();
+  const { workflowRunId, workflowPermanentId } = useParams();
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const { getSaveData } = useWorkflowHasChangesStore();
+  const hasInitializedPosition = useRef(false);
+  const hasScrolledOnLoad = useRef(false);
+  const hasAutoSentRef = useRef(false);
+  const isWaitingForLiveBrowser = shouldWaitForLiveBrowser({
+    requiresLiveBrowser,
+    isLiveBrowserReady,
+  });
+  const isQueuedPromptWaiting = Boolean(queuedPrompt);
+  // Reset on initialMessage change so a re-arrival of the prop (without a
+  // remount) can fire auto-send again.
+  useEffect(() => {
+    hasAutoSentRef.current = false;
+  }, [initialMessage]);
+  const onInitialMessageConsumedRef = useRef(onInitialMessageConsumed);
+  useEffect(() => {
+    onInitialMessageConsumedRef.current = onInitialMessageConsumed;
+  }, [onInitialMessageConsumed]);
+  // Pinned per workflow so dep-change re-fires can't clobber locally-pushed
+  // messages, and so auto-send has a synchronous "history loaded" gate.
+  const historyLoadedForRef = useRef<string | null>(null);
+
+  const scrollToBottom = (behavior: ScrollBehavior) => {
+    messagesEndRef.current?.scrollIntoView({ behavior });
+  };
+
+  const adjustTextareaHeight = useCallback(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 150)}px`;
+  }, []);
+
+  useEffect(() => {
+    adjustTextareaHeight();
+  }, [adjustTextareaHeight, inputValue]);
+
+  const handleNewChat = () => {
+    setMessages([]);
+    setQueuedPrompt(null);
+    setWorkflowCopilotChatId(null);
+    setProposedWorkflow(null);
+    setAutoAccept(false);
+    hasScrolledOnLoad.current = false;
+  };
+
+  const applyWorkflowUpdate = useCallback(
+    (
+      workflow: WorkflowApiResponse,
+      options?: { persisted?: boolean },
+    ): boolean => {
+      if (!onWorkflowUpdate) {
+        return true;
+      }
+      try {
+        onWorkflowUpdate(workflow, options);
+        return true;
+      } catch (updateError) {
+        console.error("Failed to update workflow:", updateError);
+        toast({
+          title: "Update failed",
+          description: "Failed to apply workflow changes. Please try again.",
+          variant: "destructive",
+        });
+        return false;
+      }
+    },
+    [onWorkflowUpdate],
+  );
+
+  const handleAcceptWorkflow = async (
+    workflow: WorkflowApiResponse,
+    alwaysAccept: boolean = false,
+  ) => {
+    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    if (!chatId) {
+      try {
+        chatId = await fetchLatestChatId();
+      } catch (resolveError) {
+        console.error(
+          "Failed to resolve chat ID before applying proposal:",
+          resolveError,
+        );
+      }
+    }
+
+    if (!chatId) {
+      // No chat id: apply locally and best-effort clear the server proposal so reload doesn't resurrect it.
+      if (!applyWorkflowUpdate(workflow)) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
+      return;
+    }
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      const response = await client.post<WorkflowApiResponse>(
+        "/workflow/copilot/apply-proposed-workflow",
+        {
+          workflow_copilot_chat_id: chatId,
+          auto_accept: alwaysAccept,
+        } as WorkflowCopilotApplyProposedWorkflowRequest,
+      );
+      // persisted=true loads as clean baseline; without it, Save would create a duplicate version.
+      if (!applyWorkflowUpdate(response.data, { persisted: true })) {
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+    } catch (applyError) {
+      // Atomic accept can fail if the server-side proposal is missing
+      // _copilot_yaml (SKY-9310 — V1 path didn't stash it). Fall back to the
+      // pre-#10568 client-side apply so users aren't blocked while a backend
+      // deploy catches up. Logged so we can still spot regressions.
+      console.error(
+        "Atomic apply failed; falling back to client-side apply:",
+        applyError,
+      );
+      if (!applyWorkflowUpdate(workflow)) {
+        toast({
+          title: "Accept failed",
+          description:
+            "Could not apply the proposed workflow. Please try again.",
+          variant: "destructive",
+        });
+        return;
+      }
+      setProposedWorkflow(null);
+      if (alwaysAccept) {
+        setAutoAccept(true);
+      }
+      void clearProposedWorkflow(alwaysAccept);
+    }
+  };
+
+  const handleRejectWorkflow = () => {
+    setProposedWorkflow(null);
+    void clearProposedWorkflow(false);
+  };
+
+  const getErrorStatus = (error: unknown): number | undefined => {
+    const response = (error as { response?: { status?: number } })?.response;
+    return response?.status;
+  };
+
+  const fetchLatestChatId = async (): Promise<string | null> => {
+    if (!workflowPermanentId) {
+      return null;
+    }
+    const client = await getClient(credentialGetter, "sans-api-v1");
+    const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+      "/workflow/copilot/chat-history",
+      {
+        params: { workflow_permanent_id: workflowPermanentId },
+      },
+    );
+    const latestChatId = response.data.workflow_copilot_chat_id ?? null;
+    setWorkflowCopilotChatId(latestChatId);
+    return latestChatId;
+  };
+
+  const clearProposedWorkflow = async (autoAcceptValue: boolean) => {
+    const clearProposalByChatId = async (chatId: string) => {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post<WorkflowCopilotClearProposedWorkflowRequest>(
+        "/workflow/copilot/clear-proposed-workflow",
+        {
+          workflow_copilot_chat_id: chatId,
+          auto_accept: autoAcceptValue,
+        } as WorkflowCopilotClearProposedWorkflowRequest,
+      );
+    };
+
+    let chatId = workflowCopilotChatIdRef.current?.trim() || null;
+    if (!chatId) {
+      try {
+        chatId = await fetchLatestChatId();
+      } catch (resolveError) {
+        console.error(
+          "Failed to resolve chat ID before clearing proposal:",
+          resolveError,
+        );
+        return;
+      }
+    }
+
+    if (!chatId) {
+      return;
+    }
+
+    try {
+      await clearProposalByChatId(chatId);
+    } catch (error) {
+      const status = getErrorStatus(error);
+      if (status === 404) {
+        try {
+          const refreshedChatId = await fetchLatestChatId();
+          if (refreshedChatId && refreshedChatId !== chatId) {
+            await clearProposalByChatId(refreshedChatId);
+            return;
+          }
+        } catch (retryError) {
+          console.error("Retry to clear proposed workflow failed:", retryError);
+        }
+      }
+      console.error("Failed to clear proposed workflow:", error);
+      toast({
+        title: "Copilot update failed",
+        description: autoAcceptValue
+          ? "Workflow was applied, but auto-accept did not update."
+          : "Failed to clear copilot proposal. Please try again.",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleReviewWorkflow = (workflow: WorkflowApiResponse) => {
+    onReviewWorkflow?.(workflow, () => setProposedWorkflow(null));
+  };
+
+  useEffect(() => {
+    if (onMessageCountChange) {
+      onMessageCountChange(messages.length);
+    }
+  }, [messages.length, onMessageCountChange]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      hasScrolledOnLoad.current = false;
+      return;
+    }
+    if (isLoadingHistory) {
+      return;
+    }
+    if (!hasScrolledOnLoad.current) {
+      scrollToBottom("auto");
+      hasScrolledOnLoad.current = true;
+      return;
+    }
+    scrollToBottom("smooth");
+  }, [messages, isLoading, isLoadingHistory, isOpen]);
+
+  useEffect(() => {
+    if (!workflowPermanentId) {
+      setMessages([]);
+      setQueuedPrompt(null);
+      setWorkflowCopilotChatId(null);
+      setProposedWorkflow(null);
+      setAutoAccept(false);
+      historyLoadedForRef.current = null;
+      return;
+    }
+
+    if (historyLoadedForRef.current === workflowPermanentId) {
+      return;
+    }
+
+    let isMounted = true;
+
+    const fetchHistory = async () => {
+      setIsLoadingHistory(true);
+      hasScrolledOnLoad.current = false;
+      try {
+        const client = await getClient(credentialGetter, "sans-api-v1");
+        const response = await client.get<WorkflowCopilotChatHistoryResponse>(
+          "/workflow/copilot/chat-history",
+          {
+            params: { workflow_permanent_id: workflowPermanentId },
+          },
+        );
+
+        if (!isMounted) return;
+
+        const historyMessages = response.data.chat_history.map(
+          (message, index) => ({
+            id: `${index}-${Date.now()}`,
+            sender: message.sender,
+            content: message.content,
+            timestamp: message.created_at,
+          }),
+        );
+        setMessages(historyMessages);
+        setWorkflowCopilotChatId(response.data.workflow_copilot_chat_id);
+        setProposedWorkflow(response.data.proposed_workflow ?? null);
+        setAutoAccept(response.data.auto_accept ?? false);
+        historyLoadedForRef.current = workflowPermanentId;
+      } catch (error) {
+        console.error("Failed to load chat history:", error);
+      } finally {
+        if (isMounted) {
+          setIsLoadingHistory(false);
+        }
+      }
+    };
+
+    fetchHistory();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [credentialGetter, workflowPermanentId]);
+
+  const cancelSend = useCallback(async () => {
+    // Capture upfront so the 15s timer below can't latch onto a next turn's controller.
+    const controllerAtCancel = streamingAbortController.current;
+    if (!controllerAtCancel) return;
+
+    const cancelToken = pendingCancelToken.current;
+    pendingCancelToken.current = null;
+    if (!cancelToken) return;
+
+    setProcessingStatus("Cancelling...");
+    setLatestNarration("");
+    setToolActivity([]);
+    cancelInFlightController.current = controllerAtCancel;
+
+    const appendCancelledBubble = () => {
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: `${Date.now()}-cancel`,
+          sender: "ai",
+          content: "Cancelled by user.",
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+    };
+
+    try {
+      const client = await getClient(credentialGetter, "sans-api-v1");
+      await client.post<void>("/workflow/copilot/cancel", {
+        cancel_token: cancelToken,
+      } as WorkflowCopilotCancelRequest);
+      // Safety net: if the SSE channel never resolves, surface a fallback
+      // bubble and abort so handleSend's finally clears "Cancelling...".
+      if (cancelSafetyTimer.current !== null) {
+        clearTimeout(cancelSafetyTimer.current);
+      }
+      cancelSafetyTimer.current = setTimeout(() => {
+        cancelSafetyTimer.current = null;
+        if (streamingAbortController.current !== controllerAtCancel) return;
+        appendCancelledBubble();
+        controllerAtCancel.abort();
+      }, 15_000);
+    } catch (error) {
+      // 503 (Redis disabled) or network failure: client-side abort still
+      // gives the user immediate feedback; the backend will run to
+      // completion in that environment. Log so we can spot it in dev.
+      console.warn("Workflow copilot cancel POST failed", error);
+      controllerAtCancel.abort();
+      appendCancelledBubble();
+    }
+  }, [credentialGetter, setToolActivity]);
+
+  const cancelQueuedPrompt = useCallback(() => {
+    if (!queuedPrompt) {
+      return;
+    }
+
+    setQueuedPrompt(null);
+    setMessages((prev) =>
+      prev.filter((message) => message.id !== queuedPrompt.id),
+    );
+    setInputValue(queuedPrompt.content);
+    window.requestAnimationFrame(() => {
+      textareaRef.current?.focus();
+      adjustTextareaHeight();
+    });
+  }, [adjustTextareaHeight, queuedPrompt]);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || !isOpen) {
+        return;
+      }
+      if (queuedPrompt) {
+        cancelQueuedPrompt();
+        return;
+      }
+      if (isLoading) {
+        cancelSend();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [cancelQueuedPrompt, cancelSend, isLoading, isOpen, queuedPrompt]);
+
+  const handleSend = useCallback(
+    async (messageOverride?: string, options: SendOptions = {}) => {
+      const candidate = messageOverride ?? inputValue;
+      if (
+        !candidate.trim() ||
+        isLoading ||
+        (queuedPrompt && !options.queuedMessageId)
+      )
+        return;
+      if (!workflowPermanentId) {
+        toast({
+          title: "Missing workflow",
+          description: "Workflow permanent ID is required to chat.",
+          variant: "destructive",
+        });
+        return;
+      }
+      if (
+        !options.skipQueue &&
+        shouldQueuePromptForLiveBrowser({
+          requiresLiveBrowser,
+          isLiveBrowserReady,
+          message: candidate,
+        })
+      ) {
+        const queued: QueuedPrompt = {
+          id: `${Date.now()}-queued`,
+          content: candidate,
+        };
+
+        setQueuedPrompt(queued);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: queued.id,
+            sender: "user",
+            content: queued.content,
+          },
+        ]);
+        setProposedWorkflow(null);
+        if (messageOverride === undefined) {
+          setInputValue("");
+        }
+        toast({
+          title: "Prompt queued",
+          description: "Copilot will start once the live browser connects.",
+        });
+        return;
+      }
+
+      const userMessageId = options.queuedMessageId ?? Date.now().toString();
+      const userMessage: ChatMessage = {
+        id: userMessageId,
+        sender: "user",
+        content: candidate,
+      };
+
+      const cancelToken = crypto.randomUUID();
+      pendingCancelToken.current = cancelToken;
+
+      pendingMessageId.current = userMessageId;
+      if (!options.queuedMessageId) {
+        setMessages((prev) => [...prev, userMessage]);
+      }
+      setProposedWorkflow(null);
+      const messageContent = candidate;
+      if (messageOverride === undefined && !options.queuedMessageId) {
+        setInputValue("");
+      }
+      setIsLoading(true);
+      setProcessingStatus("Starting...");
+      setLatestNarration("");
+      setToolActivity([]);
+
+      const abortController = new AbortController();
+      streamingAbortController.current?.abort();
+      streamingAbortController.current = abortController;
+
+      try {
+        const saveData = getSaveData();
+        const workflowId = saveData?.workflow.workflow_id;
+        let workflowYaml = "";
+
+        if (!workflowId) {
+          toast({
+            title: "Missing workflow",
+            description: "Workflow ID is required to chat.",
+            variant: "destructive",
+          });
+          return;
+        }
+
+        if (saveData) {
+          const extraHttpHeaders: Record<string, string> = {};
+          if (saveData.settings.extraHttpHeaders) {
+            try {
+              const parsedHeaders = JSON.parse(
+                saveData.settings.extraHttpHeaders,
+              );
+              if (
+                parsedHeaders &&
+                typeof parsedHeaders === "object" &&
+                !Array.isArray(parsedHeaders)
+              ) {
+                for (const [key, value] of Object.entries(parsedHeaders)) {
+                  if (key && typeof key === "string") {
+                    extraHttpHeaders[key] = String(value);
+                  }
+                }
+              }
+            } catch (error) {
+              console.error("Error parsing extra HTTP headers:", error);
+            }
+          }
+
+          const scriptCacheKey = saveData.settings.scriptCacheKey ?? "";
+          const normalizedKey =
+            scriptCacheKey === ""
+              ? "default"
+              : saveData.settings.scriptCacheKey;
+
+          const requestBody: WorkflowCreateYAMLRequest = {
+            title: saveData.title,
+            description: saveData.workflow.description,
+            proxy_location: saveData.settings.proxyLocation,
+            webhook_callback_url: saveData.settings.webhookCallbackUrl,
+            persist_browser_session: saveData.settings.persistBrowserSession,
+            model: saveData.settings.model,
+            max_screenshot_scrolls: saveData.settings.maxScreenshotScrolls,
+            totp_verification_url: saveData.workflow.totp_verification_url,
+            extra_http_headers: extraHttpHeaders,
+            run_with: saveData.settings.runWith,
+            cache_key: normalizedKey,
+            ai_fallback: saveData.settings.aiFallback ?? true,
+            code_version:
+              saveData.settings.runWith === "code"
+                ? (saveData.settings.codeVersion ?? 2)
+                : undefined,
+            workflow_definition: {
+              version: saveData.workflowDefinitionVersion,
+              parameters: saveData.parameters,
+              blocks: saveData.blocks,
+            },
+            is_saved_task: saveData.workflow.is_saved_task,
+            status: saveData.workflow.status,
+            run_sequentially: saveData.settings.runSequentially,
+            sequential_key: saveData.settings.sequentialKey,
+          };
+
+          workflowYaml = convertToYAML(requestBody);
+        }
+
+        const handleProcessingUpdate = (
+          payload: WorkflowCopilotProcessingUpdate,
+        ) => {
+          if (payload.status) {
+            setProcessingStatus(payload.status);
+          }
+
+          const pendingId = pendingMessageId.current;
+          if (!pendingId || !payload.timestamp) {
+            return;
+          }
+
+          setMessages((prev) =>
+            prev.map((message) =>
+              message.id === pendingId
+                ? { ...message, timestamp: payload.timestamp }
+                : message,
+            ),
+          );
+        };
+
+        const handleResponse = (
+          response: WorkflowCopilotStreamResponseUpdate,
+        ) => {
+          // Stream completed; a Cancel click after this point should no-op.
+          pendingCancelToken.current = null;
+          setWorkflowCopilotChatId(response.workflow_copilot_chat_id);
+
+          const aiMessage: ChatMessage = {
+            id: Date.now().toString(),
+            sender: "ai",
+            content: response.message,
+            timestamp: response.response_time,
+          };
+
+          setMessages((prev) => [...prev, aiMessage]);
+          const userCancelledThisTurn =
+            cancelInFlightController.current === abortController;
+          if (
+            response.updated_workflow &&
+            autoAccept &&
+            !response.unvalidated &&
+            !response.cancelled &&
+            !userCancelledThisTurn
+          ) {
+            applyWorkflowUpdate(response.updated_workflow);
+          } else {
+            setProposedWorkflow(response.updated_workflow ?? null);
+          }
+        };
+
+        const handleError = (payload: WorkflowCopilotStreamErrorUpdate) => {
+          pendingCancelToken.current = null;
+          const errorMessage: ChatMessage = {
+            id: Date.now().toString(),
+            sender: "ai",
+            content: payload.error,
+          };
+          setMessages((prev) => [...prev, errorMessage]);
+        };
+
+        const client = await getSseClient(credentialGetter);
+        await client.postStreaming<WorkflowCopilotSsePayload>(
+          "/workflow/copilot/chat-post",
+          {
+            workflow_id: workflowId,
+            workflow_permanent_id: workflowPermanentId,
+            workflow_copilot_chat_id: workflowCopilotChatId,
+            workflow_run_id: workflowRunId,
+            browser_session_id: liveBrowserSessionId ?? null,
+            message: messageContent,
+            workflow_yaml: workflowYaml,
+            cancel_token: cancelToken,
+          } as WorkflowCopilotChatRequest,
+          (payload) => {
+            switch (payload.type) {
+              case "processing_update":
+                handleProcessingUpdate(payload);
+                return false;
+              case "tool_call":
+                setProcessingStatus(
+                  TOOL_DISPLAY_NAMES[payload.tool_name] ??
+                    payload.tool_name + "...",
+                );
+                setToolActivity((prev) => applyToolCall(prev, payload));
+                return false;
+              case "tool_result":
+                setToolActivity((prev) => applyToolResult(prev, payload));
+                return false;
+              case "condensing":
+                if (payload.status === "started") {
+                  setProcessingStatus("Condensing context...");
+                }
+                return false;
+              case "narration":
+                if (payload.narration) {
+                  setLatestNarration(payload.narration);
+                }
+                return false;
+              case "block_progress":
+                setToolActivity((prev) => applyBlockProgress(prev, payload));
+                return false;
+              case "response":
+                handleResponse(payload);
+                return true;
+              case "error":
+                handleError(payload);
+                return true;
+              default:
+                return false;
+            }
+          },
+          { signal: abortController.signal },
+        );
+      } catch (error) {
+        if (abortController.signal.aborted) {
+          return;
+        }
+        console.error("Failed to send message:", error);
+        const errorMessage: ChatMessage = {
+          id: Date.now().toString(),
+          sender: "ai",
+          content: "Sorry, I encountered an error. Please try again.",
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      } finally {
+        if (streamingAbortController.current === abortController) {
+          streamingAbortController.current = null;
+        }
+        if (cancelInFlightController.current === abortController) {
+          cancelInFlightController.current = null;
+        }
+        if (cancelSafetyTimer.current !== null) {
+          clearTimeout(cancelSafetyTimer.current);
+          cancelSafetyTimer.current = null;
+        }
+        pendingMessageId.current = null;
+        pendingCancelToken.current = null;
+        setIsLoading(false);
+        setProcessingStatus("");
+        setLatestNarration("");
+        setToolActivity([]);
+      }
+    },
+    [
+      applyWorkflowUpdate,
+      autoAccept,
+      credentialGetter,
+      getSaveData,
+      inputValue,
+      isLiveBrowserReady,
+      isLoading,
+      liveBrowserSessionId,
+      queuedPrompt,
+      requiresLiveBrowser,
+      workflowCopilotChatId,
+      workflowPermanentId,
+      workflowRunId,
+    ],
+  );
+
+  const handleKeyPress = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  useEffect(() => {
+    // Drain only when the browser is actually ready (non-null session id from
+    // the parent). If requiresLiveBrowser flips to false without a session
+    // (rate-limit, pane hidden), the queue stays so user intent isn't sent
+    // with browser_session_id=null.
+    if (
+      !queuedPrompt ||
+      !liveBrowserSessionId ||
+      isLoading ||
+      !workflowPermanentId
+    ) {
+      return;
+    }
+
+    const promptToSend = queuedPrompt;
+    setQueuedPrompt(null);
+    handleSend(promptToSend.content, {
+      queuedMessageId: promptToSend.id,
+      skipQueue: true,
+    }).catch((error) => {
+      console.error("Queued send failed:", error);
+    });
+  }, [
+    handleSend,
+    isLoading,
+    liveBrowserSessionId,
+    queuedPrompt,
+    workflowPermanentId,
+  ]);
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory || isLoading || !workflowPermanentId || queuedPrompt) {
+      return;
+    }
+    // Synchronous gate: isLoadingHistory state is stale in this effect's
+    // closure when both effects run in the same commit.
+    if (historyLoadedForRef.current !== workflowPermanentId) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (
+      !saveData?.workflow.workflow_id ||
+      saveData.workflow.workflow_permanent_id !== workflowPermanentId
+    ) {
+      return;
+    }
+    // Trip the guard before any await so the 5s timeout cannot toast over
+    // an in-flight send. handleSend internally routes to the queue when the
+    // live browser isn't ready yet.
+    hasAutoSentRef.current = true;
+    onInitialMessageConsumedRef.current?.();
+    handleSend(initialMessage).catch((error) => {
+      console.error("Auto-send failed:", error);
+    });
+  }, [
+    handleSend,
+    initialMessage,
+    isLoading,
+    isLoadingHistory,
+    queuedPrompt,
+    getSaveData,
+    workflowPermanentId,
+  ]);
+
+  useEffect(() => {
+    if (!initialMessage || hasAutoSentRef.current) {
+      return;
+    }
+    if (isLoadingHistory || isWaitingForLiveBrowser || queuedPrompt) {
+      return;
+    }
+    const saveData = getSaveData();
+    if (!saveData?.workflow.workflow_id) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      if (hasAutoSentRef.current) return;
+      hasAutoSentRef.current = true;
+      onInitialMessageConsumedRef.current?.();
+      toast({
+        title: "Could not auto-send message",
+        description:
+          "The copilot was not ready in time — please retype your prompt.",
+        variant: "destructive",
+      });
+    }, AUTO_SEND_TIMEOUT_MS);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [
+    initialMessage,
+    isLoadingHistory,
+    isWaitingForLiveBrowser,
+    queuedPrompt,
+    getSaveData,
+  ]);
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    setIsDragging(true);
+    setDragStart({
+      x: e.clientX - position.x,
+      y: e.clientY - position.y,
+    });
+  };
+
+  const handleResizeMouseDown = (
+    e: React.MouseEvent,
+    direction: "n" | "s" | "e" | "w" | "se" | "sw" | "ne" | "nw",
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsResizing(true);
+    setResizeDirection(direction);
+    setResizeStart({
+      x: e.clientX,
+      y: e.clientY,
+      width: size.width,
+      height: size.height,
+      posX: position.x,
+      posY: position.y,
+    });
+  };
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (isDragging) {
+        setPosition({
+          x: e.clientX - dragStart.x,
+          y: e.clientY - dragStart.y,
+        });
+      }
+      if (isResizing) {
+        const deltaX = e.clientX - resizeStart.x;
+        const deltaY = e.clientY - resizeStart.y;
+
+        let newWidth = resizeStart.width;
+        let newHeight = resizeStart.height;
+        let newX = resizeStart.posX;
+        let newY = resizeStart.posY;
+
+        // Corners
+        if (resizeDirection === "se") {
+          // Southeast: resize from bottom-right
+          newWidth = Math.max(MIN_WINDOW_WIDTH, resizeStart.width + deltaX);
+          newHeight = Math.max(MIN_WINDOW_HEIGHT, resizeStart.height + deltaY);
+        } else if (resizeDirection === "sw") {
+          // Southwest: resize from bottom-left
+          newWidth = Math.max(MIN_WINDOW_WIDTH, resizeStart.width - deltaX);
+          newHeight = Math.max(MIN_WINDOW_HEIGHT, resizeStart.height + deltaY);
+          if (resizeStart.width - deltaX >= MIN_WINDOW_WIDTH) {
+            newX = resizeStart.posX + deltaX;
+          }
+        } else if (resizeDirection === "ne") {
+          // Northeast: resize from top-right
+          newWidth = Math.max(MIN_WINDOW_WIDTH, resizeStart.width + deltaX);
+          newHeight = Math.max(MIN_WINDOW_HEIGHT, resizeStart.height - deltaY);
+          if (resizeStart.height - deltaY >= MIN_WINDOW_HEIGHT) {
+            newY = resizeStart.posY + deltaY;
+          }
+        } else if (resizeDirection === "nw") {
+          // Northwest: resize from top-left
+          newWidth = Math.max(MIN_WINDOW_WIDTH, resizeStart.width - deltaX);
+          newHeight = Math.max(MIN_WINDOW_HEIGHT, resizeStart.height - deltaY);
+          if (resizeStart.width - deltaX >= MIN_WINDOW_WIDTH) {
+            newX = resizeStart.posX + deltaX;
+          }
+          if (resizeStart.height - deltaY >= MIN_WINDOW_HEIGHT) {
+            newY = resizeStart.posY + deltaY;
+          }
+        }
+        // Edges
+        else if (resizeDirection === "n") {
+          // North: resize from top
+          newHeight = Math.max(MIN_WINDOW_HEIGHT, resizeStart.height - deltaY);
+          if (resizeStart.height - deltaY >= MIN_WINDOW_HEIGHT) {
+            newY = resizeStart.posY + deltaY;
+          }
+        } else if (resizeDirection === "s") {
+          // South: resize from bottom
+          newHeight = Math.max(MIN_WINDOW_HEIGHT, resizeStart.height + deltaY);
+        } else if (resizeDirection === "e") {
+          // East: resize from right
+          newWidth = Math.max(MIN_WINDOW_WIDTH, resizeStart.width + deltaX);
+        } else if (resizeDirection === "w") {
+          // West: resize from left
+          newWidth = Math.max(MIN_WINDOW_WIDTH, resizeStart.width - deltaX);
+          if (resizeStart.width - deltaX >= MIN_WINDOW_WIDTH) {
+            newX = resizeStart.posX + deltaX;
+          }
+        }
+
+        setSize({
+          width: newWidth,
+          height: newHeight,
+        });
+        setPosition({
+          x: newX,
+          y: newY,
+        });
+      }
+    };
+
+    const handleMouseUp = () => {
+      setIsDragging(false);
+      setIsResizing(false);
+    };
+
+    if (isDragging || isResizing) {
+      document.addEventListener("mousemove", handleMouseMove);
+      document.addEventListener("mouseup", handleMouseUp);
+    }
+
+    return () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+    };
+  }, [isDragging, dragStart, isResizing, resizeStart, resizeDirection]);
+
+  // Handle window resize to keep chat window within viewport
+  useEffect(() => {
+    const handleResize = () => {
+      setPosition((prev) =>
+        constrainPosition(prev.x, prev.y, size.width, size.height),
+      );
+    };
+
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, [size]);
+
+  // Recalculate position when chat opens to align with button (only first time)
+  useLayoutEffect(() => {
+    if (isOpen && buttonRef?.current && !hasInitializedPosition.current) {
+      const newPosition = calculateDefaultPosition(
+        size.width,
+        size.height,
+        buttonRef,
+      );
+      setPosition(newPosition);
+      hasInitializedPosition.current = true;
+    }
+  }, [isOpen, buttonRef, size.width, size.height]);
+
+  if (!isOpen) {
+    return null;
+  }
+
+  const inputDisabled = isLoading || Boolean(queuedPrompt);
+  const queuedPromptWaitingStatus =
+    "Prompt queued. Waiting for live browser...";
+  const browserStatusText = queuedPrompt
+    ? queuedPromptWaitingStatus
+    : isWaitingForLiveBrowser
+      ? "Live browser is starting. Send now to queue your prompt."
+      : null;
+
+  return (
+    <div
+      className="fixed z-50 flex flex-col rounded-lg border border-slate-700 bg-slate-900 shadow-2xl"
+      style={{
+        left: `${position.x}px`,
+        top: `${position.y}px`,
+        width: `${size.width}px`,
+        height: `${size.height}px`,
+      }}
+    >
+      {/* Header */}
+      <div
+        className="flex cursor-move items-center justify-between border-b border-slate-700 px-4 py-2"
+        onMouseDown={handleMouseDown}
+      >
+        <h3 className="text-sm font-semibold text-slate-200">
+          Workflow Copilot (Beta)
+        </h3>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleNewChat}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="rounded border border-slate-700 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800"
+          >
+            New chat
+          </button>
+          <div className="h-2 w-2 rounded-full bg-green-500"></div>
+          <span className="text-xs text-slate-400">Active</span>
+          <button
+            type="button"
+            onClick={() => onClose?.()}
+            onMouseDown={(e) => e.stopPropagation()}
+            className="ml-2 rounded p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-200"
+            title="Close"
+          >
+            <Cross2Icon className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div className="flex-1 overflow-y-auto p-4">
+        <div className="space-y-3">
+          {!isLoadingHistory && messages.length === 0 && !isLoading ? (
+            <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-4 text-sm text-slate-300">
+              <p className="font-semibold text-slate-200">Start a new chat</p>
+              <p className="mt-2 text-slate-400">
+                Ask the copilot to draft or edit your workflow. Provide a goal,
+                the target site, and any credentials it should use.
+              </p>
+              <p className="mt-2 text-slate-400">
+                Example: "Build workflow to find the top post on hackernews
+                today"
+              </p>
+            </div>
+          ) : null}
+          {messages.map((message, index) => {
+            const isLastMessage = index === messages.length - 1;
+            const showProposedPanel = isLastMessage && proposedWorkflow;
+            const showQueuedFooter =
+              isQueuedPromptWaiting && message.id === queuedPrompt?.id;
+            return (
+              <MessageItem
+                key={message.id}
+                message={message}
+                footer={
+                  showQueuedFooter ? (
+                    <div className="flex items-center gap-2 text-xs text-slate-400">
+                      <ReloadIcon className="h-3 w-3 animate-spin" />
+                      <span>{queuedPromptWaitingStatus}</span>
+                    </div>
+                  ) : showProposedPanel ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleReviewWorkflow(proposedWorkflow)}
+                        className="rounded border border-blue-500/60 bg-blue-500/10 px-3 py-1 text-xs text-blue-100 hover:bg-blue-500/20"
+                      >
+                        Review
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleAcceptWorkflow(proposedWorkflow)}
+                        className="rounded bg-green-600 px-3 py-1 text-xs text-white hover:bg-green-700"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleAcceptWorkflow(proposedWorkflow, true)
+                        }
+                        className="rounded bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700"
+                      >
+                        Always accept
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleRejectWorkflow}
+                        className="rounded bg-red-600 px-3 py-1 text-xs text-white hover:bg-red-700"
+                      >
+                        Reject
+                      </button>
+                    </>
+                  ) : null
+                }
+              />
+            );
+          })}
+          {(isLoading || isQueuedPromptWaiting) && (
+            <div className="flex items-start gap-3">
+              <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-blue-600 text-xs font-bold text-white">
+                AI
+              </div>
+              <div className="flex-1 rounded-lg bg-slate-800 p-3">
+                <div className="flex items-center gap-2 text-sm text-slate-300">
+                  <ReloadIcon className="h-4 w-4 animate-spin" />
+                  <span>
+                    {isQueuedPromptWaiting
+                      ? queuedPromptWaitingStatus
+                      : latestNarration || processingStatus || "Processing..."}
+                  </span>
+                </div>
+                {isQueuedPromptWaiting ? (
+                  <div className="mt-2 text-xs text-slate-500">
+                    Copilot will start automatically once the browser is ready.
+                  </div>
+                ) : null}
+                {!isQueuedPromptWaiting && toolActivity.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {toolActivity.map((activity) => {
+                      const isRetrySuccess =
+                        activity.status === "success" &&
+                        activity.linkedRecovery === true;
+                      const tooltip = activity.detail ?? activity.summary;
+                      const displayName =
+                        TOOL_DISPLAY_NAMES[activity.tool_name] ??
+                        activity.tool_name;
+                      const containerClass = `flex items-start gap-1.5 text-xs text-slate-500${
+                        activity.linkedRecovery
+                          ? " border-l border-amber-400/40 pl-2"
+                          : ""
+                      }`;
+                      return (
+                        <div
+                          key={activity.tool_call_id}
+                          className={containerClass}
+                        >
+                          <span
+                            className={`mt-1.5 inline-block h-1.5 w-1.5 shrink-0 rounded-full ${getActivityDotClass(activity)}`}
+                          />
+                          <span
+                            className="line-clamp-2 min-w-0 flex-1"
+                            title={tooltip}
+                          >
+                            {isRetrySuccess ? "↻ " : ""}
+                            {displayName}
+                            {activity.summary ? ` — ${activity.summary}` : ""}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+          <div ref={messagesEndRef} />
+        </div>
+      </div>
+
+      {/* Input */}
+      <div className="border-t border-slate-700 p-3">
+        {browserStatusText ? (
+          <div className="mb-2 text-xs text-slate-400">{browserStatusText}</div>
+        ) : null}
+        <div className="flex items-end gap-2">
+          <textarea
+            ref={textareaRef}
+            placeholder={
+              queuedPrompt
+                ? "Prompt queued..."
+                : isWaitingForLiveBrowser
+                  ? "Type a prompt to queue..."
+                  : "Type your message... (Shift+Enter for new line)"
+            }
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyDown={handleKeyPress}
+            disabled={inputDisabled}
+            rows={1}
+            className="flex-1 resize-none rounded-md border border-slate-600 bg-slate-800 px-3 py-2 text-sm text-slate-200 placeholder-slate-500 focus:border-blue-500 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+            style={{
+              minHeight: "38px",
+              maxHeight: "150px",
+              overflow: "auto",
+            }}
+          />
+          {isLoading || Boolean(queuedPrompt) ? (
+            <button
+              onClick={isLoading ? cancelSend : cancelQueuedPrompt}
+              title={isLoading ? "Stop Copilot" : "Edit queued prompt"}
+              className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+            >
+              Cancel
+            </button>
+          ) : (
+            <button
+              onClick={() => handleSend()}
+              className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Send
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* Resize Handles */}
+      {/* Corners */}
+      <div
+        className="absolute bottom-0 right-0 z-10 h-3 w-3 cursor-nwse-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "se")}
+        title="Resize"
+      />
+      <div
+        className="absolute bottom-0 left-0 z-10 h-3 w-3 cursor-nesw-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "sw")}
+        title="Resize"
+      />
+      <div
+        className="absolute right-0 top-0 z-10 h-3 w-3 cursor-nesw-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "ne")}
+        title="Resize"
+      />
+      <div
+        className="absolute left-0 top-0 z-10 h-3 w-3 cursor-nwse-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "nw")}
+        title="Resize"
+      />
+      {/* Edges */}
+      <div
+        className="absolute left-3 right-3 top-0 z-10 h-1 cursor-ns-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "n")}
+        title="Resize"
+      />
+      <div
+        className="absolute bottom-0 left-3 right-3 z-10 h-1 cursor-ns-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "s")}
+        title="Resize"
+      />
+      <div
+        className="absolute bottom-3 left-0 top-3 z-10 w-1 cursor-ew-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "w")}
+        title="Resize"
+      />
+      <div
+        className="absolute bottom-3 right-0 top-3 z-10 w-1 cursor-ew-resize"
+        onMouseDown={(e) => handleResizeMouseDown(e, "e")}
+        title="Resize"
+      />
+    </div>
+  );
+}

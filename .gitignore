@@ -77,3 +77,16 @@ ehthumbs.db
 runtime/skyvern/chrome-data/
 runtime/skyvern/browser-data/
 chrome-data/
+
+# ============ 大型二进制文件（通过 Release 发布） ============
+app.jar
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# ============ Skyvern 大型媒体文件 ============
+runtime/skyvern/docs/images/*.mp4
+runtime/skyvern/fern/images/*.mp4
+runtime/skyvern/fern/images/*.png
+runtime/skyvern/docs/images/*.png

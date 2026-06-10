@@ -1,92 +1,85 @@
-# ============ 环境配置文件（API密钥等敏感信息） ============
-.env
-.env.local
-.env.*.local
-.env.production
-.env.development
-
-# ============ 数据库文件 ============
-*.db
-*.sqlite
-*.sqlite3
-
-# ============ 日志文件 ============
-*.log
-logs/
-*.log.*
-
-# ============ 用户个人文件 ============
-# 简历文件（用户的简历不应上传到GitHub）
-resume/
-cv/
-**/resume/**
-**/cv/**
-
-# ============ Skyvern 运行时数据 ============
-runtime/skyvern/data/
-runtime/skyvern/.env
-runtime/skyvern/.claude/
-
-# ============ Python ============
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-venv/
-.venv/
-*.egg-info/
-dist/
-build/
-
-# ============ Node.js ============
-node_modules/
-.next/
-out/
-.nuxt/
-package-lock.json
-
-# ============ Java ============
 target/
-*.class
+!.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+config.yaml
+.git-rewrite
+### IntelliJ IDEA ###
+*.iws
+*.iml
+*.ipr
+.idea
+*.sh
+CLAUDE.md
+.claude
+nul
+dist.zip
+db/
+# Playwright
+.playwright/
+ms-playwright/
+playwright-*
 
-# ============ IDE ============
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.project
+### Eclipse ###
+.apt_generated
 .classpath
-.settings/
-
-# ============ OS 文件 ============
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+### VS Code ###
+.vscode/
+data.json
+src/main/java/boss/data.json
+merge_prs.log
+### Mac OS ###
 .DS_Store
-Thumbs.db
-desktop.ini
-ehthumbs.db
+cookie.json
+.env
+*.log
+*.err.log
+chromedriver
+*.jpg
 
-# ============ 临时文件 ============
-*.tmp
-*.temp
-.tmp/
-*.bak
-*.backup
+# Database files
+db/
+*.db
+runtime/skyvern/.env
+runtime/skyvern/**/__pycache__/
+runtime/skyvern/data/
+runtime/skyvern/chrome-profile/
+runtime/skyvern/downloads/
+runtime/skyvern/har/
+runtime/skyvern/log/
+runtime/skyvern/logs/
+runtime/skyvern/temp/
+runtime/skyvern/video/
 
-# ============ Chrome 浏览器数据 ============
-runtime/skyvern/chrome-data/
-runtime/skyvern/browser-data/
-chrome-data/
+# Frontend build output
+dist/
 
-# ============ 大型二进制文件（通过 Release 发布） ============
-app.jar
+# Gradle cache
+.gradle/
+
+# Browser profiles and user data
+runtime/browser-profiles/
+runtime/applications/
+runtime/resumes/
+
+# Video files (too large for git)
 *.mp4
-*.avi
 *.mov
-*.mkv
+*.avi
 
-# ============ Skyvern 大型媒体文件 ============
-runtime/skyvern/docs/images/*.mp4
-runtime/skyvern/fern/images/*.mp4
-runtime/skyvern/fern/images/*.png
-runtime/skyvern/docs/images/*.png
+# Large binary files
+*.pma
